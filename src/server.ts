@@ -41,6 +41,11 @@ export class BlenderServer extends EventEmitter {
         var body = { type: 'update' };
 
         const response = await this.client.create('', body);
+        if (response.statusCode != 200){
+            throw Error("update addon returned with statuscode " + response.statusCode);
+        }
+        
+        this.emit(Events.AddonUpdated);
         return response.result;
     }
 
@@ -68,14 +73,15 @@ export class BlenderServer extends EventEmitter {
         }
     }
 
-     public dispose() {
-         super.removeAllListeners();
-         this._addonServer.close();
-     }
+    public dispose() {
+        super.removeAllListeners();
+        this._addonServer.close();
+    }
 }
 export enum Events {
     Debug = "debug",
     Update = "update",
     InsertNewOperator = "insert-new-operator",
-    InsertNewPanel = "insert-new-panel"
+    InsertNewPanel = "insert-new-panel",
+    AddonUpdated = 'addon-updated'
 }

@@ -101,13 +101,12 @@ function COMMAND_launchAddon() {
 
 function COMMAND_updateAddon(onSuccess: (() => void) | undefined = undefined) {
     vscode.workspace.saveAll(false);
-    request.post(
-        `http://localhost:${BLENDER_PORT}`,
-        { json: { type: 'update' } },
-        function (err: any, response: any, body: any) {
-            if (err === null && onSuccess !== undefined) onSuccess();
-        }
-    );
+    blenderServer.updateAddon().then(()=>{
+        if(onSuccess)
+            onSuccess();
+    }).catch((err)=>{
+        //TODO error?
+    })    
 }
 
 /* Event Handlers
