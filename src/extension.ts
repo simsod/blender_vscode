@@ -1,20 +1,30 @@
 'use strict';
 
 import * as vscode from 'vscode';
-var path = require('path');
-var fs = require('fs');
-var http = require('http');
-var request = require('request');
-const { exec, spawn } = require('child_process');
+import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as http from 'http';
+import { exec, spawn } from 'child_process';
+import * as utils from './utils';
 
-let pythonFilesDir = path.join(path.dirname(__dirname), 'pythonFiles');
-let templateFilesDir = path.join(pythonFilesDir, 'templates');
-let pipPath = path.join(pythonFilesDir, 'get-pip.py');
-let CANCEL = 'CANCEL';
+import {
+    OperatorSettings,
+    PanelSettings
+} from './template-settings';
+import { BlenderServer, Events } from './server';
 
-let SERVER_PORT = 6000;
-let BLENDER_PORT : number | undefined = undefined;
+const request = require('request');
 
+const PYTHON_FILES_DIR = path.join(path.dirname(__dirname), 'pythonFiles');
+const TEMPLATE_FILES_DIR = path.join(PYTHON_FILES_DIR, 'templates');
+const PIP_PATH = path.join(PYTHON_FILES_DIR, 'get-pip.py');
+const CANCEL = 'CANCEL';
+
+const SERVER_PORT = 6000;
+let BLENDER_PORT: number | undefined = undefined;
+
+let blenderServer: BlenderServer
 export function activate(context: vscode.ExtensionContext) {
     let disposables = [
         vscode.commands.registerCommand('b3ddev.startBlender', COMMAND_startBlender),
@@ -25,13 +35,13 @@ export function activate(context: vscode.ExtensionContext) {
     ];
 
     context.subscriptions.push(...disposables);
-
-    let server = http.createServer(SERVER_handleRequest);
-    server.listen(SERVER_PORT);
+    blenderServer = new BlenderServer(SERVER_PORT);
+    context.subscriptions.push(blenderServer);
 }
 
 export function deactivate() {
 }
+
 
 /* Commands
  *********************************************/
@@ -39,11 +49,11 @@ export function deactivate() {
 function COMMAND_startBlender() {
     tryGetBlenderPath(true, blenderPath => {
         exec(blenderPath);
-    }, showErrorIfNotCancel);
+    }, utils.showErrorIfNotCancel);
 }
 
 function COMMAND_newAddon() {
-    let workspaceFolders = getWorkspaceFolders();
+    let workspaceFolders = utils.getWorkspaceFolders();
     if (workspaceFolders.length === 0) {
         vscode.window.showOpenDialog({
             canSelectFiles: false,
@@ -60,37 +70,41 @@ function COMMAND_newAddon() {
         vscode.window.showErrorMessage('Can\'t create a new addon in a workspace with multiple folders yet.');
     }
 
-    function tryMakeAddonInFolder(folderPath : string, openWorkspace : boolean = false) {
+    function tryMakeAddonInFolder(folderPath: string, openWorkspace: boolean = false) {
         canAddonBeCreatedInFolder(folderPath, () => {
             askUser_SettingsForNewAddon((addonName, authorName) => {
                 createNewAddon(folderPath, addonName, authorName, mainPath => {
                     if (openWorkspace) {
                         /* Extension will automatically be restarted after this. */
-                        vscode.workspace.updateWorkspaceFolders(0, null, {uri: vscode.Uri.file(folderPath), name: addonName});
+                        vscode.workspace.updateWorkspaceFolders(0, null, { uri: vscode.Uri.file(folderPath), name: addonName });
                     } else {
                         vscode.workspace.openTextDocument(mainPath).then(document => {
                             vscode.window.showTextDocument(document);
                         });
                     }
                 });
-            }, showErrorIfNotCancel);
-        }, showErrorIfNotCancel);
+            }, utils.showErrorIfNotCancel);
+        }, utils.showErrorIfNotCancel);
     }
 }
 
 function COMMAND_launchAddon() {
+    console.log("Subscribed to debug event");
     tryGetBlenderPath(true, blenderPath => {
         launch_Single_External(blenderPath, (<vscode.WorkspaceFolder[]>vscode.workspace.workspaceFolders)[0].uri.fsPath);
-    }, showErrorIfNotCancel);
+        blenderServer.on(Events.Debug, startPythonDebugging)
+        blenderServer.on(Events.InsertNewOperator, (settings) => insertTemplate_SimpleOperator(settings, utils.showErrorIfNotCancel))
+        blenderServer.on(Events.InsertNewPanel, (settings) => insertTemplate_Panel(settings, utils.showErrorIfNotCancel))
+    }, utils.showErrorIfNotCancel);
 
 }
 
-function COMMAND_updateAddon(onSuccess : (() => void) | undefined = undefined) {
+function COMMAND_updateAddon(onSuccess: (() => void) | undefined = undefined) {
     vscode.workspace.saveAll(false);
     request.post(
         `http://localhost:${BLENDER_PORT}`,
-        {json: {type: 'update'}},
-        function (err : any, response : any, body : any) {
+        { json: { type: 'update' } },
+        function (err: any, response: any, body: any) {
             if (err === null && onSuccess !== undefined) onSuccess();
         }
     );
@@ -99,64 +113,36 @@ function COMMAND_updateAddon(onSuccess : (() => void) | undefined = undefined) {
 /* Event Handlers
  ***************************************/
 
-function HANDLER_updateOnSave(document : vscode.TextDocument) {
-    if (getConfiguration().get('updateOnSave')) {
+function HANDLER_updateOnSave(document: vscode.TextDocument) {
+    if (utils.getConfiguration().get('updateOnSave')) {
         COMMAND_updateAddon(() => {
             vscode.window.showInformationMessage("Addon Updated");
         });
     }
 }
 
-
-/* Server
- ***************************************/
-
-function SERVER_handleRequest(request : any, response : any) {
-    console.log(request);
-    if (request.method === 'POST') {
-        let body = '';
-        request.on('data', (chunk : any) => body += chunk.toString());
-        request.on('end', () => {
-            let res = JSON.parse(body);
-            if (res.type === 'setup') {
-                BLENDER_PORT = res.blenderPort;
-                startPythonDebugging(res.debugPort);
-                response.end('OK');
-            } else if (res.type === 'newOperator') {
-                let settings = new OperatorSettings(res.name, res.group);
-                insertTemplate_SimpleOperator(settings, showErrorIfNotCancel);
-                response.end('OK');
-            } else if (res.type === 'newPanel') {
-                let settings = new PanelSettings(res.name, res.spaceType, res.regionType, res.group);
-                insertTemplate_Panel(settings, showErrorIfNotCancel);
-                response.end('OK');
-            }
-        });
-    }
-}
-
-function startPythonDebugging(port : number) {
+function startPythonDebugging(config: any) {
     let configuration = {
         name: "Debug Python in Blender",
         request: "attach",
         type: "python",
-        port: port,
+        port: config.debugPort,
         host: "localhost"
     };
     vscode.debug.startDebugging(undefined, configuration);
 }
 
-function launch_Single_External(blenderPath : string, launchDirectory : string) {
-    let pyLaunchPath = path.join(pythonFilesDir, 'launch_external.py');
-    runExternalCommand(blenderPath, ['--python', pyLaunchPath], {
+function launch_Single_External(blenderPath: string, launchDirectory: string) {
+    let pyLaunchPath = path.join(PYTHON_FILES_DIR, 'launch_external.py');
+    utils.runExternalCommand(blenderPath, ['--python', pyLaunchPath], {
         ADDON_DEV_DIR: launchDirectory,
         DEBUGGER_PORT: SERVER_PORT,
-        PIP_PATH: pipPath,
+        PIP_PATH: PIP_PATH,
     });
 }
 
-function tryGetBlenderPath(allowAskUser : boolean, onSuccess : (path : string) => void, onError : (reason : string) => void) {
-    let config = getConfiguration();
+function tryGetBlenderPath(allowAskUser: boolean, onSuccess: (path: string) => void, onError: (reason: string) => void) {
+    let config = utils.getConfiguration();
     let savedBlenderPath = config.get('blenderPath');
 
     if (savedBlenderPath !== undefined && savedBlenderPath !== "") {
@@ -170,7 +156,7 @@ function tryGetBlenderPath(allowAskUser : boolean, onSuccess : (path : string) =
     }
 }
 
-function askUser_SettingsForNewAddon(onSuccess : (addonName : string, authorName : string) => void, onError : (reason : string) => void) {
+function askUser_SettingsForNewAddon(onSuccess: (addonName: string, authorName: string) => void, onError: (reason: string) => void) {
     vscode.window.showInputBox({
         placeHolder: 'Addon Name (can be changed later)',
     }).then(addonName => {
@@ -181,9 +167,7 @@ function askUser_SettingsForNewAddon(onSuccess : (addonName : string, authorName
             return;
         }
 
-        vscode.window.showInputBox({
-            placeHolder: 'Your Name (can be changed later)',
-        }).then(authorName => {
+        vscode.window.showInputBox({ placeHolder: 'Your Name (can be changed later)' }).then(authorName => {
             if (authorName === undefined) {
                 onError(CANCEL);
             } else if (authorName === "") {
@@ -195,21 +179,27 @@ function askUser_SettingsForNewAddon(onSuccess : (addonName : string, authorName
     });
 }
 
-function askUser_BlenderPath(onSuccess : (path : string) => void, onError : (reason : string) => void) {
-    vscode.window.showOpenDialog({
+function askUser_BlenderPath(onSuccess: (path: string) => void, onError: (reason: string) => void) {
+    var dialogSettings = {
         canSelectFiles: true,
         canSelectFolders: false,
         canSelectMany: false,
         openLabel: 'Blender Executable'
-    }).then(value => {
+    };
+
+    vscode.window.showOpenDialog(dialogSettings).then(value => {
         if (value === undefined) {
             onError(CANCEL);
             return;
         }
         let filepath = value[0].fsPath;
+        if (os.platform() === 'darwin') {
+            filepath = `${filepath}/Contents/MacOS/blender`;
+        }
+
         testIfPathIsBlender(filepath, is_valid => {
             if (is_valid) {
-                getConfiguration().update('blenderPath', filepath);
+                utils.getConfiguration().update('blenderPath', filepath);
                 onSuccess(filepath);
             } else {
                 onError('Selected file is not a valid Blender executable.');
@@ -218,37 +208,38 @@ function askUser_BlenderPath(onSuccess : (path : string) => void, onError : (rea
     });
 }
 
-function createNewAddon(folder : string, addonName : string, authorName : string, onSuccess : (mainPath : string) => void) {
-    let initSourcePath = path.join(templateFilesDir, 'addon.py');
+function createNewAddon(folder: string, addonName: string, authorName: string, onSuccess: (mainPath: string) => void) {
+    let initSourcePath = path.join(TEMPLATE_FILES_DIR, 'addon.py');
     let initTargetPath = path.join(folder, "__init__.py");
-    readTextFile(initSourcePath, text => {
+    utils.readTextFile(initSourcePath, text => {
         text = text.replace('ADDON_NAME', addonName);
         text = text.replace('AUTHOR_NAME', authorName);
 
-        fs.writeFile(initTargetPath, text, (err : Error) => {
+        fs.writeFile(initTargetPath, text, (err: Error) => {
             if (err !== null) {
                 vscode.window.showErrorMessage('Could not create the __init__.py file.');
                 return;
             }
             onSuccess(initTargetPath);
         });
-    }, showErrorIfNotCancel);
+    }, utils.showErrorIfNotCancel);
 }
 
 
 /* Checking
  ***************************************/
 
-function testIfPathIsBlender(filepath : string, callback : (isValid : boolean) => void) {
-    let name : string = path.basename(filepath);
+function testIfPathIsBlender(filepath: string, callback: (isValid: boolean) => void) {
+    let name: string = path.basename(filepath);
 
     if (name.toLowerCase().startsWith('blender')) {
-        /* not starting in background because some addons might
-         * crash Blender before the expression is executed */
         let testString = '###TEST_BLENDER###';
         let command = `${filepath} --python-expr "import sys;print('${testString}');sys.stdout.flush();sys.exit()"`;
+
+        /* not starting in background because some addons might
+         * crash Blender before the expression is executed */
         exec(command, {},
-            (err : Error, stdout : string | Buffer, stderr : string | Buffer) => {
+            (err: Error | null, stdout: string | Buffer, stderr: string | Buffer) => {
                 let text = stdout.toString();
                 callback(text.includes(testString));
             });
@@ -257,15 +248,15 @@ function testIfPathIsBlender(filepath : string, callback : (isValid : boolean) =
     }
 }
 
-function canAddonBeCreatedInFolder(folder : string, onSuccess : () => void, onError : (reason : string) => void) {
-    fs.stat(folder, (err : Error, stat : any) => {
+function canAddonBeCreatedInFolder(folder: string, onSuccess: () => void, onError: (reason: string) => void) {
+    fs.stat(folder, (err: Error, stat: any) => {
         if (err !== null) onError('Error when accesing the folder.');
         if (!stat.isDirectory()) onError('Not a directory.');
 
-        fs.readdir(folder, {}, (err : Error, files : string[]) => {
+        fs.readdir(folder, (err, files: string[]) => {
             for (let name of files) {
                 if (!name.startsWith('.')) {
-                    onError('The folder already contains some files.');
+                    onError('The folder already contains some files');
                     return;
                 }
             }
@@ -275,30 +266,9 @@ function canAddonBeCreatedInFolder(folder : string, onSuccess : () => void, onEr
 }
 
 
-/* Operator insertion
- **************************************/
-
-class OperatorSettings {
-    name : string;
-    group : string;
-
-    constructor(name : string, group : string) {
-        this.name = name;
-        this.group = group;
-    }
-
-    getIdName() {
-        return `${this.group}.${nameToIdentifier(this.name)}`;
-    }
-
-    getClassName() {
-        return nameToClassIdentifier(this.name) + 'Operator';
-    }
-}
-
-function insertTemplate_SimpleOperator(settings : OperatorSettings, onError : (reason : string) => void) {
-    let sourcePath = path.join(templateFilesDir, 'operator_simple.py');
-    readTextFile(sourcePath, text => {
+function insertTemplate_SimpleOperator(settings: OperatorSettings, onError: (reason: string) => void) {
+    let sourcePath = path.join(TEMPLATE_FILES_DIR, 'operator_simple.py');
+    utils.readTextFile(sourcePath, text => {
         text = text.replace('LABEL', settings.name);
         text = text.replace('OPERATOR_CLASS', 'bpy.types.Operator');
         text = text.replace('IDNAME', settings.getIdName());
@@ -311,31 +281,9 @@ function insertTemplate_SimpleOperator(settings : OperatorSettings, onError : (r
 /* Panel Insertion
 **************************************/
 
-class PanelSettings {
-    name : string;
-    spaceType : string;
-    regionType : string;
-    group : string;
-
-    constructor(name : string, spaceType : string, regionType : string, group : string) {
-        this.name = name;
-        this.spaceType = spaceType;
-        this.regionType = regionType;
-        this.group = group;
-    }
-
-    getIdName() {
-        return `${this.group}_PT_${nameToIdentifier(this.name)}`;
-    }
-
-    getClassName() {
-        return nameToClassIdentifier(this.name) + 'Panel';
-    }
-}
-
-function insertTemplate_Panel(settings : PanelSettings, onError : (reason : string) => void) {
-    let sourcePath = path.join(templateFilesDir, 'panel_simple.py');
-    readTextFile(sourcePath, text => {
+function insertTemplate_Panel(settings: PanelSettings, onError: (reason: string) => void) {
+    let sourcePath = path.join(TEMPLATE_FILES_DIR, 'panel_simple.py');
+    utils.readTextFile(sourcePath, text => {
         text = text.replace('LABEL', settings.name);
         text = text.replace('PANEL_CLASS', 'bpy.types.Panel');
         text = text.replace('SPACE_TYPE', settings.spaceType);
@@ -349,7 +297,7 @@ function insertTemplate_Panel(settings : PanelSettings, onError : (reason : stri
 /* Text Block insertion
  **************************************/
 
-function insertTextBlock(text : string, onError : (reason : string) => void) {
+function insertTextBlock(text: string, onError: (reason: string) => void) {
     let editor = vscode.window.activeTextEditor;
 
     if (editor === undefined) {
@@ -369,17 +317,17 @@ function insertTextBlock(text : string, onError : (reason : string) => void) {
     vscode.workspace.applyEdit(workspaceEdit);
 }
 
-function findNextLineStartingInTheBeginning(document : vscode.TextDocument, start : number) : number {
+function findNextLineStartingInTheBeginning(document: vscode.TextDocument, start: number): number {
     for (let i = start; i < document.lineCount; i++) {
         let line = document.lineAt(i);
-        if (line.text.length > 0 &&line.firstNonWhitespaceCharacterIndex === 0) {
+        if (line.text.length > 0 && line.firstNonWhitespaceCharacterIndex === 0) {
             return i;
         }
     }
     return document.lineCount;
 }
 
-function findLastLineContainingText(document : vscode.TextDocument, start : number ) : number {
+function findLastLineContainingText(document: vscode.TextDocument, start: number): number {
     for (let i = start; i >= 0; i--) {
         let line = document.lineAt(i);
         if (!line.isEmptyOrWhitespace) {
@@ -387,70 +335,4 @@ function findLastLineContainingText(document : vscode.TextDocument, start : numb
         }
     }
     return 0;
-}
-
-
-/* Utilities
- *******************************************/
-
-function nameToIdentifier(name : string) {
-    return name.toLowerCase().replace(/\W+/, '_');
-}
-
-function nameToClassIdentifier(name : string) {
-    let parts = name.split(/\W+/);
-    let result = '';
-    let allowNumber = false;
-    for (let part of parts) {
-        if (part.length > 0 && (allowNumber || !startsWithNumber(part))) {
-            result += part.charAt(0).toUpperCase() + part.slice(1);
-            allowNumber = true;
-        }
-    }
-    return result;
-}
-
-function startsWithNumber(text : string) {
-    return text.charAt(0).match(/[0-9]/) !== null;
-}
-
-function getConfiguration() {
-    return vscode.workspace.getConfiguration('b3ddev');
-}
-
-function readTextFile(path : string, onSuccess : (text : string) => void, onError : (reason : string) => void) {
-    fs.readFile(path, 'utf8', (err : Error, data : any) => {
-        if (err !== null) {
-            onError(`Could not read the file: ${path}`);
-            return;
-        }
-
-        onSuccess(data);
-    });
-}
-
-function runExternalCommand(command : string, args : string[], additionalEnv : any = {}) {
-    let env = Object.assign({}, process.env, additionalEnv);
-    let config = vscode.workspace.getConfiguration('terminal.external');
-    if (process.platform === 'linux') {
-        spawn(config.get('linuxExec'), ['-e', command, ...args], {env:env});
-    } else if (process.platform === 'win32') {
-        let fullCommand = 'start "" "' + command.replace('"', '//"') + '" ';
-        for (let arg of args) {
-            fullCommand += ' "' + arg.replace('"', '//"') + '" ';
-        }
-        exec(fullCommand, {env:env});
-    }
-}
-
-function showErrorIfNotCancel(message : string) {
-    if (message !== CANCEL) {
-        vscode.window.showErrorMessage(message);
-    }
-}
-
-function getWorkspaceFolders() {
-    let folders = vscode.workspace.workspaceFolders;
-    if (folders === undefined) return [];
-    else return folders;
 }

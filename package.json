@@ -75,7 +75,8 @@
         "@types/mocha": "^2.2.42"
     },
     "dependencies": {
-        "request": "^2.87.0"
+        "request": "^2.87.0",
+        "typed-rest-client": "^1.0.11"
     },
     "extensionDependencies": [
         "ms-python.python"
